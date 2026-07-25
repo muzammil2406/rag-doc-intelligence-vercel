@@ -5,6 +5,7 @@ frontend/node_modules/
 
 # Build output
 dist/
+tsconfig.build.tsbuildinfo
 backend/dist/
 frontend/.next/
 
