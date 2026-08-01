@@ -1,85 +1,193 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { GoogleGenerativeAIEmbeddings } from '@langchain/google-genai';
 import { PrismaService } from '../prisma/prisma.service';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as pdfParse from 'pdf-parse';
-import { RecursiveCharacterTextSplitter } from 'langchain/text_splitter';
-import { Document as LangchainDocument } from '@langchain/core/documents';
+
+interface TextChunk {
+  pageContent: string;
+  metadata: {
+    documentId: string;
+    pageNumber: number;
+    source: string;
+  };
+}
 
 @Injectable()
 export class RagService implements OnModuleInit {
   private readonly logger = new Logger(RagService.name);
-  private embeddings: GoogleGenerativeAIEmbeddings;
-
-  private readonly textSplitter = new RecursiveCharacterTextSplitter({
-    chunkSize: 1000,
-    chunkOverlap: 200,
-    separators: ['\n\n', '\n', '. ', ' ', ''],
-  });
 
   constructor(private prisma: PrismaService) {}
 
-  async onModuleInit() {
-    this.embeddings = new GoogleGenerativeAIEmbeddings({
-      modelName: 'gemini-embedding-001',
-      apiKey: process.env.GOOGLE_API_KEY!,
-    });
+  onModuleInit() {
     this.logger.log('RAG service ready (PostgreSQL vector store)');
   }
 
+  private async embedTexts(texts: string[]): Promise<number[][]> {
+    const apiKey = process.env.GOOGLE_API_KEY!;
+    const model = 'gemini-embedding-001';
+    const batchSize = 100;
+    const embeddings: number[][] = [];
+
+    for (let i = 0; i < texts.length; i += batchSize) {
+      const batch = texts.slice(i, i + batchSize);
+
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:batchEmbedContents?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            requests: batch.map((text) => ({
+              model: `models/${model}`,
+              content: { parts: [{ text }] },
+            })),
+          }),
+        },
+      );
+
+      if (!res.ok) {
+        const error = await res.text();
+        throw new Error(`Gemini embeddings error: ${res.status} ${error}`);
+      }
+
+      const data = await res.json();
+      const values = data.embeddings.map(
+        (e: { values: number[] }) => e.values,
+      );
+      embeddings.push(...values);
+    }
+
+    return embeddings;
+  }
+
+  private async embedQuery(text: string): Promise<number[]> {
+    const apiKey = process.env.GOOGLE_API_KEY!;
+    const model = 'gemini-embedding-001';
+
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: `models/${model}`,
+          content: { parts: [{ text }] },
+        }),
+      },
+    );
+
+    if (!res.ok) {
+      const error = await res.text();
+      throw new Error(`Gemini embedding error: ${res.status} ${error}`);
+    }
+
+    const data = await res.json();
+    return data.embedding.values;
+  }
+
+  private splitText(
+    text: string,
+    chunkSize = 1000,
+    chunkOverlap = 200,
+    separators = ['\n\n', '\n', '. ', ' ', ''],
+  ): string[] {
+    const chunks: string[] = [];
+
+    const recursive = (content: string): void => {
+      if (content.length <= chunkSize) {
+        if (content.trim()) chunks.push(content.trim());
+        return;
+      }
+
+      let splitIndex = -1;
+      let splitLen = -1;
+
+      for (const sep of separators) {
+        const idx = content.lastIndexOf(sep, chunkSize);
+        if (idx > -1 && idx > splitIndex) {
+          splitIndex = idx;
+          splitLen = sep.length;
+        }
+      }
+
+      if (splitIndex === -1) {
+        splitIndex = chunkSize;
+        splitLen = 0;
+      }
+
+      const part = content.substring(0, splitIndex);
+      if (part.trim()) chunks.push(part.trim());
+
+      const rest = content.substring(splitIndex + splitLen);
+      if (rest.length > 0) recursive(rest);
+    };
+
+    recursive(text);
+    return chunks;
+  }
+
   async processPdf(filePath: string, documentId: string): Promise<number> {
-    this.logger.log(`Processing PDF: ${filePath} for document: ${documentId}`);
+    this.logger.log(
+      `Processing PDF: ${filePath} for document: ${documentId}`,
+    );
 
     const buffer = fs.readFileSync(filePath);
     const pdfData = await pdfParse(buffer);
 
-    this.logger.log(`Parsed PDF: ${pdfData.numpages} pages, ${pdfData.text.length} chars`);
+    this.logger.log(
+      `Parsed PDF: ${pdfData.numpages} pages, ${pdfData.text.length} chars`,
+    );
 
     const pageTexts = this.extractPageTexts(pdfData);
 
-    const docs = pageTexts
+    const docs: TextChunk[] = pageTexts
       .filter((pt) => pt.text.trim().length >= 30)
-      .map(
-        (pt) =>
-          new LangchainDocument({
-            pageContent: pt.text.trim(),
-            metadata: {
-              documentId,
-              pageNumber: pt.pageNumber,
-              source: path.basename(filePath),
-            },
-          }),
-      );
+      .map((pt) => ({
+        pageContent: pt.text.trim(),
+        metadata: {
+          documentId,
+          pageNumber: pt.pageNumber,
+          source: path.basename(filePath),
+        },
+      }));
 
     this.logger.log(`Kept ${docs.length} pages with valid text`);
 
     if (docs.length === 0) {
       this.logger.warn('No valid text found in PDF — may be image-only');
-      try { fs.unlinkSync(filePath); } catch {}
+      try {
+        fs.unlinkSync(filePath);
+      } catch {}
       return 0;
     }
 
-    const chunks = await this.textSplitter.splitDocuments(docs);
+    const chunks: string[] = [];
+    for (const doc of docs) {
+      chunks.push(...this.splitText(doc.pageContent));
+    }
     this.logger.log(`Split into ${chunks.length} chunks`);
 
-    const texts = chunks.map((c) => c.pageContent);
-    const embeddings = await this.embeddings.embedDocuments(texts);
+    const embeddings = await this.embedTexts(chunks);
     this.logger.log(`Generated ${embeddings.length} embeddings`);
 
-    await this.prisma.chunk.createMany({
-      data: chunks.map((chunk, i) => ({
-        documentId,
-        content: chunk.pageContent,
-        embedding: embeddings[i],
-        pageNumber:
-          chunk.metadata.loc?.pageNumber ||
-          chunk.metadata.page ||
-          i + 1,
-      })),
-    });
+    let chunkIndex = 0;
+    const rows = [];
+    for (const doc of docs) {
+      const docChunks = this.splitText(doc.pageContent);
+      for (const chunkContent of docChunks) {
+        rows.push({
+          documentId,
+          content: chunkContent,
+          embedding: embeddings[chunkIndex],
+          pageNumber: doc.metadata.pageNumber,
+        });
+        chunkIndex++;
+      }
+    }
 
-    this.logger.log(`Stored ${chunks.length} chunks in PostgreSQL`);
+    await this.prisma.chunk.createMany({ data: rows });
+    this.logger.log(`Stored ${rows.length} chunks in PostgreSQL`);
 
     try {
       fs.unlinkSync(filePath);
@@ -88,14 +196,14 @@ export class RagService implements OnModuleInit {
       this.logger.warn(`Could not delete temp file: ${filePath}`);
     }
 
-    return chunks.length;
+    return rows.length;
   }
 
   async queryDocument(
     question: string,
     documentId: string,
   ): Promise<{ content: string; pageNumber: number; score: number }[]> {
-    const questionEmbedding = await this.embeddings.embedQuery(question);
+    const questionEmbedding = await this.embedQuery(question);
 
     const chunks = await this.prisma.chunk.findMany({
       where: { documentId },
@@ -140,7 +248,9 @@ export class RagService implements OnModuleInit {
     return dot / (Math.sqrt(normA) * Math.sqrt(normB));
   }
 
-  private extractPageTexts(pdfData: any): { pageNumber: number; text: string }[] {
+  private extractPageTexts(
+    pdfData: any,
+  ): { pageNumber: number; text: string }[] {
     const fullText: string = pdfData.text || '';
     if (!fullText.trim()) return [];
 
@@ -158,7 +268,10 @@ export class RagService implements OnModuleInit {
 
     if (pages.length === 0 && fullText.trim()) {
       const chunkSize = 3000;
-      const textChunks = fullText.match(new RegExp(`[\\s\\S]{1,${chunkSize}}`, 'g')) || [fullText];
+      const textChunks =
+        fullText.match(new RegExp(`[\\s\\S]{1,${chunkSize}}`, 'g')) || [
+          fullText,
+        ];
       textChunks.forEach((chunk, i) => {
         const text = this.sanitizeText(chunk);
         if (text.trim().length > 0) {
