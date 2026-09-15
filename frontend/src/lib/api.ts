@@ -1,18 +1,11 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+const PROXY_BASE = '/api/proxy';
 
 const REQUEST_TIMEOUT_MS = 30000;
 
 async function request(path: string, options: RequestInit = {}) {
-  const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
+  const headers: Record<string, string> = { ...(options.headers as Record<string, string>) };
 
-  const headers: Record<string, string> = {
-    ...(options.headers as Record<string, string> || {}),
-  };
-
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-
+  headers['Accept'] = 'application/json';
   if (!(options.body instanceof FormData)) {
     headers['Content-Type'] = 'application/json';
   }
@@ -22,7 +15,7 @@ async function request(path: string, options: RequestInit = {}) {
 
   let res: Response;
   try {
-    res = await fetch(`${API_BASE}${path}`, {
+    res = await fetch(`${PROXY_BASE}${path}`, {
       ...options,
       headers,
       signal: controller.signal,
@@ -36,6 +29,11 @@ async function request(path: string, options: RequestInit = {}) {
     clearTimeout(timeout);
   }
 
+  if (res.status === 401 && typeof window !== 'undefined') {
+    window.location.href = '/auth';
+    throw new Error('Session expired. Please sign in again.');
+  }
+
   if (!res.ok) {
     const error = await res.json().catch(() => ({ message: 'Request failed' }));
     throw new Error(error.message || `HTTP ${res.status}`);
@@ -45,20 +43,6 @@ async function request(path: string, options: RequestInit = {}) {
 }
 
 export const api = {
-  register: (email: string, password: string) =>
-    request('/auth/register', {
-      method: 'POST',
-      body: JSON.stringify({ email, password }),
-    }),
-
-  login: (email: string, password: string) =>
-    request('/auth/login', {
-      method: 'POST',
-      body: JSON.stringify({ email, password }),
-    }),
-
-  getProfile: () => request('/auth/profile'),
-
   uploadDocument: (file: File) => {
     const formData = new FormData();
     formData.append('file', file);
@@ -80,4 +64,39 @@ export const api = {
 
   getChatHistory: (documentId: string) =>
     request(`/query/${documentId}/history`),
+};
+
+export const auth = {
+  login: async (email: string, password: string) => {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) throw new Error(data?.message ?? 'Login failed.');
+    return data;
+  },
+
+  register: async (email: string, password: string) => {
+    const res = await fetch('/api/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) throw new Error(data?.message ?? 'Registration failed.');
+    return data;
+  },
+
+  logout: async () => {
+    await fetch('/api/auth/logout', { method: 'POST' });
+  },
+
+  me: async () => {
+    const res = await fetch('/api/auth/me');
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    return data?.user ?? null;
+  },
 };

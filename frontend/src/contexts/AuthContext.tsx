@@ -1,7 +1,7 @@
 'use client';
 
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
-import { api } from '@/lib/api';
+import { auth } from '@/lib/api';
 import { useRouter } from 'next/navigation';
 
 interface User {
@@ -14,7 +14,7 @@ interface AuthContextType {
   loading: boolean;
   login: (email: string, password: string) => Promise<void>;
   register: (email: string, password: string) => Promise<void>;
-  logout: () => void;
+  logout: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -25,37 +25,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const router = useRouter();
 
   useEffect(() => {
-    const token = localStorage.getItem('token');
-    if (token) {
-      api
-        .getProfile()
-        .then((data) => {
-          setUser(data);
-          setLoading(false);
-        })
-        .catch(() => {
-          localStorage.removeItem('token');
-          setLoading(false);
-        });
-    } else {
-      setLoading(false);
-    }
+    auth
+      .me()
+      .then((me) => {
+        setUser(me);
+        setLoading(false);
+      })
+      .catch(() => setLoading(false));
   }, []);
 
   const login = async (email: string, password: string) => {
-    const data = await api.login(email, password);
-    localStorage.setItem('token', data.token);
+    const data = await auth.login(email, password);
     setUser(data.user);
   };
 
   const register = async (email: string, password: string) => {
-    const data = await api.register(email, password);
-    localStorage.setItem('token', data.token);
+    const data = await auth.register(email, password);
     setUser(data.user);
   };
 
-  const logout = () => {
-    localStorage.removeItem('token');
+  const logout = async () => {
+    await auth.logout();
     setUser(null);
     router.push('/auth');
   };
